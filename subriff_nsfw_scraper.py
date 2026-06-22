@@ -6,9 +6,14 @@ Scrapes NSFW subreddits from two sources:
   1. subriff.com  — trending/fastest-growing NSFW communities (browser + DOM)
   2. nsfwdog.com  — 89k+ established communities via direct API
                     api2.nsfwdog.com/v1/subreddits/top/?ordering=-subscribers
-                    Standard DRF pagination, 16 results per page.
-                    Capped at --nsfwdog-limit (default 10,000) — sorted
-                    largest-first so small/unknown subs are excluded.
+                    16 results per page, capped at --nsfwdog-limit (default 10,000)
+
+Each nsfwdog result item has:
+  slug         "gone-wild"          (nsfwdog slug, NOT the Reddit name)
+  url_path     "/view/gonewild"     (contains the actual Reddit subreddit name)
+  heading      "Gone Wild"          (display name)
+
+We extract from url_path.
 
 Merges both lists, applies a gay/trans keyword filter, and writes:
   NSFWsubreddits.txt  (one subreddit per line, no r/ prefix)
@@ -125,36 +130,50 @@ def dedupe(names: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Extract subreddit names from one page of results
+# Extract subreddit names from one page of nsfwdog results
 # ---------------------------------------------------------------------------
 
-SUBREDDIT_NAME_FIELDS = (
-    "name", "subreddit_name", "subredditName",
-    "display_name", "displayName", "slug",
-)
-
-def extract_from_results(data: dict, log_fields: bool = False) -> list[str]:
+def extract_from_results(data: dict, log_sample: bool = False) -> list[str]:
     """
-    Extract subreddit names ONLY from the 'results' array in a DRF response.
-    Each item in results is one subreddit — we grab its name field directly
-    rather than walking the whole tree.
+    Extract subreddit names from the 'results' array.
+
+    nsfwdog result items look like:
+      slug:      "gone-wild"        (their own slug — NOT the Reddit name)
+      url_path:  "/view/gonewild"   (contains the actual Reddit subreddit name)
+      heading:   "Gone Wild"
+
+    We extract from url_path. If url_path is missing we fall back to
+    stripping hyphens from slug (less reliable but better than nothing).
     """
     results = data.get("results", [])
 
-    if log_fields and results:
+    if log_sample and results:
         first = results[0] if isinstance(results[0], dict) else {}
         print(f"  [nsfwdog] Result item keys: {list(first.keys())}")
-        print(f"  [nsfwdog] Sample item: { {k: str(v)[:40] for k, v in list(first.items())[:5]} }")
+        # Log all fields of the first item so we can verify url_path
+        for k, v in first.items():
+            print(f"  [nsfwdog]   {k}: {str(v)[:80]}")
 
     names = []
     for item in results:
         if not isinstance(item, dict):
             continue
-        for field in SUBREDDIT_NAME_FIELDS:
-            val = item.get(field)
-            if val and isinstance(val, str) and re.match(r'^[A-Za-z0-9_]{2,50}$', val.strip()):
-                names.append(val.strip())
-                break  # only take one name per result item
+
+        # Primary: url_path contains the actual Reddit subreddit name
+        url_path = item.get("url_path", "")
+        if url_path:
+            m = re.search(r'/view/([A-Za-z0-9_]+)', url_path)
+            if m:
+                names.append(m.group(1))
+                continue
+
+        # Fallback: strip hyphens from slug ("gone-wild" → "gonewild")
+        # This is imperfect but better than skipping the entry entirely
+        slug = item.get("slug", "")
+        if slug:
+            cleaned = slug.replace("-", "")
+            if re.match(r'^[A-Za-z0-9_]{2,50}$', cleaned):
+                names.append(cleaned)
 
     return names
 
@@ -216,7 +235,7 @@ def scrape_subriff(args: argparse.Namespace) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# nsfwdog (direct API, targeted extraction)
+# nsfwdog (direct API)
 # ---------------------------------------------------------------------------
 
 def scrape_nsfwdog(args: argparse.Namespace) -> list[str]:
@@ -246,13 +265,12 @@ def scrape_nsfwdog(args: argparse.Namespace) -> list[str]:
             time.sleep(2)
             continue
 
-        # Log the structure of page 1 and the item fields
-        log_fields = (page_num == 1)
         if page_num == 1:
             print(f"  [nsfwdog] Total indexed: {data.get('count', '?'):,}")
 
-        names = extract_from_results(data, log_fields=log_fields)
-        next_url = data.get("next")  # follow DRF's own next URL
+        # Log full first item so we can verify the url_path field
+        names = extract_from_results(data, log_sample=(page_num == 1))
+        next_url = data.get("next")
 
         if not names:
             consecutive_empty += 1
