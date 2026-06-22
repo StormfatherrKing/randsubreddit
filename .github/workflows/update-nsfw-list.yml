@@ -2,12 +2,13 @@ name: Update NSFW Subreddit List
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # every day at 06:00 UTC
-  workflow_dispatch:       # lets you trigger it manually from the Actions tab
+    - cron: "0 6 * * *"
+  workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     permissions:
       contents: write
@@ -23,11 +24,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright
+          pip install playwright requests
           playwright install chromium --with-deps
 
-      - name: Run scraper (subriff + nsfwdog)
-        run: python subriff_nsfw_scraper.py --sort --order daily --filter-log
+      - name: Run scraper
+        run: |
+          python subriff_nsfw_scraper.py \
+            --sort \
+            --order daily \
+            --filter-log \
+            --nsfwdog-limit 10000
 
       - name: Commit updated list
         run: |
