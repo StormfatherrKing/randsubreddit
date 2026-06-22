@@ -3,23 +3,26 @@
 subriff_nsfw_scraper.py
 -----------------------
 Scrapes NSFW subreddits from two sources:
-  1. subriff.com  — trending/fastest-growing NSFW communities (DOM scrape)
-  2. nsfwdog.com  — established NSFW communities (Firestore API interception)
+  1. subriff.com  — trending/fastest-growing NSFW communities (DOM + pagination)
+  2. nsfwdog.com  — 89k+ established NSFW communities
 
-nsfwdog is built on Firebase/Firestore. Instead of scraping HTML, we intercept
-the network requests the site makes to the Firestore API and extract the raw
-JSON data. This is more reliable than DOM scraping and captures everything the
-site has indexed regardless of scroll position or pagination.
+For nsfwdog, we use a two-phase approach:
+  Phase 1 — open the page in a browser, intercept ALL network responses to
+             discover the real API endpoint and parameters.
+  Phase 2 — hit that API directly with requests (no browser), paginating
+             through all results. Much faster than clicking through pages.
+  Fallback — if API sniffing fails, fall back to browser pagination (capped).
 
 Merges both lists, applies a gay/trans keyword filter, and writes:
   NSFWsubreddits.txt  (one subreddit per line, no r/ prefix)
 
 Dependencies:
-    pip install playwright
+    pip install playwright requests
     playwright install chromium
 
 Usage:
     python subriff_nsfw_scraper.py
+    python subriff_nsfw_scraper.py --nsfwdog-limit 10000   # top 10k by size
     python subriff_nsfw_scraper.py --no-filter
     python subriff_nsfw_scraper.py --filter-log
     python subriff_nsfw_scraper.py --sort
@@ -29,18 +32,22 @@ Usage:
 """
 
 import argparse
-import json
 import re
 import sys
 import time
 from pathlib import Path
 
 try:
-    from playwright.sync_api import sync_playwright, Route, Request
+    import requests as req_lib
+except ImportError:
+    req_lib = None  # handled at runtime if needed
+
+try:
+    from playwright.sync_api import sync_playwright
 except ImportError:
     sys.exit(
         "playwright not installed.\n"
-        "Run:  pip install playwright && playwright install chromium"
+        "Run:  pip install playwright requests && playwright install chromium"
     )
 
 
@@ -75,10 +82,11 @@ TRANS_KEYWORDS = [
 USE_TRAP_FILTER = True
 WHITELIST: set[str] = set()
 
-PAGE_LOAD_WAIT  = 2_500
-SCROLL_WAIT     = 1_200
-MAX_PAGES       = 50
-MAX_SCROLLS     = 80
+PAGE_LOAD_WAIT      = 2_500   # ms — browser waits
+NSFWDOG_API_TIMEOUT = 15      # seconds per requests call
+NSFWDOG_API_DELAY   = 0.25    # seconds between API calls (be polite)
+MAX_SUBRIFF_PAGES   = 50
+MAX_NSFWDOG_BROWSER_PAGES = 100   # fallback only
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +134,18 @@ def merge(*lists: list[str]) -> list[str]:
     return result
 
 
+def dedupe(names: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out = []
+    for n in names:
+        if n.lower() not in seen:
+            seen.add(n.lower())
+            out.append(n)
+    return out
+
+
 # ---------------------------------------------------------------------------
-# Subriff scraper (DOM)
+# Subriff scraper (browser + DOM pagination)
 # ---------------------------------------------------------------------------
 
 def subriff_extract_page(page) -> list[str]:
@@ -169,7 +187,7 @@ def scrape_subriff(args: argparse.Namespace) -> list[str]:
         page.locator("a:has-text('NSFW')").first.click()
         page.wait_for_timeout(PAGE_LOAD_WAIT)
 
-        for page_num in range(1, MAX_PAGES + 1):
+        for page_num in range(1, MAX_SUBRIFF_PAGES + 1):
             names = subriff_extract_page(page)
             print(f"  [subriff] Page {page_num}: {len(names)} subreddits")
             all_names.extend(names)
@@ -187,60 +205,65 @@ def scrape_subriff(args: argparse.Namespace) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# nsfwdog scraper (Firestore network interception)
+# nsfwdog — Phase 1: API sniffing
 # ---------------------------------------------------------------------------
 
-def extract_subreddit_names_from_firestore_json(data: dict | list) -> list[str]:
+class ApiInfo:
+    """Holds whatever we learned about the nsfwdog API from network interception."""
+    def __init__(self):
+        self.responses: list[dict] = []   # raw response dicts {url, headers, body}
+        self.candidate_url: str = ""
+        self.candidate_headers: dict = {}
+        self.page_size: int = 0
+        self.names_from_first_page: list[str] = []
+
+
+def _looks_like_subreddit_list(data) -> list[str]:
     """
-    Walk any Firestore REST response and pull out subreddit names.
-    Firestore REST responses look like:
-      {"documents": [{"fields": {"name": {"stringValue": "gonewild"}, ...}}, ...]}
-    or a single document:
-      {"fields": {"name": {"stringValue": "gonewild"}, ...}}
-    We also try "subreddit", "subredditName", "title", "id", "slug" fields.
-    Additionally we look for reddit.com/r/<name> URLs embedded in the data.
+    Given a parsed JSON body, try to extract a list of subreddit names.
+    Returns list of names found (empty if this doesn't look like subreddit data).
     """
     names = []
-    raw_str = json.dumps(data)
+    raw = str(data)
 
-    # Pattern 1: reddit.com/r/<name> URLs anywhere in the JSON
-    for m in re.finditer(r'reddit\.com/r/([A-Za-z0-9_]{2,50})', raw_str):
+    # Look for /view/<name> patterns (nsfwdog's own links embedded in JSON)
+    for m in re.finditer(r'/view/([A-Za-z0-9_]{2,50})', raw):
+        if m.group(1).lower() != "example":
+            names.append(m.group(1))
+
+    # Look for reddit.com/r/<name> patterns
+    for m in re.finditer(r'reddit\.com/r/([A-Za-z0-9_]{2,50})', raw):
         names.append(m.group(1))
 
-    # Pattern 2: common field names that likely hold the subreddit name
-    name_fields = {"name", "subreddit", "subredditName", "subreddit_name",
-                   "title", "id", "slug", "community", "displayName"}
-
-    def walk(obj):
+    # Walk JSON for common name-like fields
+    def walk(obj, depth=0):
+        if depth > 10:
+            return
         if isinstance(obj, dict):
-            # Firestore stringValue wrapper
-            for key, val in obj.items():
-                if key in name_fields and isinstance(val, dict) and "stringValue" in val:
-                    candidate = val["stringValue"]
-                    # Must look like a subreddit name (no spaces, reasonable length)
-                    if re.match(r'^[A-Za-z0-9_]{2,50}$', candidate):
-                        names.append(candidate)
-                elif key in name_fields and isinstance(val, str):
-                    candidate = val.strip().lstrip("r/")
-                    if re.match(r'^[A-Za-z0-9_]{2,50}$', candidate):
-                        names.append(candidate)
-                walk(val)
+            for key in ("name", "subreddit", "subredditName", "id", "slug",
+                        "community", "displayName", "title"):
+                val = obj.get(key)
+                if isinstance(val, str) and re.match(r'^[A-Za-z0-9_]{2,50}$', val.strip()):
+                    names.append(val.strip())
+            for v in obj.values():
+                walk(v, depth + 1)
         elif isinstance(obj, list):
             for item in obj:
-                walk(item)
+                walk(item, depth + 1)
 
-    walk(data)
-    return names
+    if isinstance(data, (dict, list)):
+        walk(data)
+
+    return dedupe(names)
 
 
-def scrape_nsfwdog(args: argparse.Namespace) -> list[str]:
+def sniff_nsfwdog_api(args: argparse.Namespace) -> ApiInfo:
     """
-    Open nsfwdog.com/browse?dir=desc, intercept all Firestore API calls,
-    capture every JSON response, scroll to trigger lazy loads, and extract
-    subreddit names from the raw Firestore data.
+    Open nsfwdog in a browser for one page, intercept all JSON API responses,
+    and try to identify the endpoint that returns the community list.
     """
-    all_names: list[str] = []
-    captured_responses: list[dict] = []
+    info = ApiInfo()
+    captured = []   # list of (url, headers, parsed_body)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=args.headless)
@@ -250,106 +273,214 @@ def scrape_nsfwdog(args: argparse.Namespace) -> list[str]:
         ))
         page = ctx.new_page()
 
-        # Intercept responses from Firestore and any generic /api/ endpoints
-        def handle_response(response):
+        def on_response(response):
             url = response.url
-            # Capture Firestore REST calls and any JSON API that looks data-like
-            if any(pattern in url for pattern in [
-                "firestore.googleapis.com",
-                "firebaseio.com",
-                "/api/",
-                "firebase.com",
-            ]):
-                try:
-                    ct = response.headers.get("content-type", "")
-                    if "json" in ct:
-                        data = response.json()
-                        captured_responses.append(data)
-                        names = extract_subreddit_names_from_firestore_json(data)
-                        if names:
-                            print(f"  [nsfwdog] API response → {len(names)} names found  ({url[:80]}…)")
-                except Exception:
-                    pass
+            try:
+                ct = response.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
+                body = response.json()
+                names = _looks_like_subreddit_list(body)
+                if names:
+                    captured.append({
+                        "url": url,
+                        "headers": dict(response.request.headers),
+                        "body": body,
+                        "names": names,
+                    })
+                    print(f"  [nsfwdog-sniff] Found {len(names)} names in: {url[:100]}")
+            except Exception:
+                pass
 
-        page.on("response", handle_response)
+        page.on("response", on_response)
 
-        url = "https://nsfwdog.com/browse?dir=desc"
-        print(f"  [nsfwdog] Opening {url} …")
-        page.goto(url, wait_until="networkidle")
+        print("  [nsfwdog] Phase 1 — sniffing API (loading first page) …")
+        page.goto("https://nsfwdog.com/browse?dir=desc", wait_until="networkidle")
         page.wait_for_timeout(PAGE_LOAD_WAIT)
 
-        # Scroll to trigger any lazy loading / pagination
-        print(f"  [nsfwdog] Scrolling to load all content (up to {MAX_SCROLLS} scrolls) …")
-        last_count = 0
-        stale = 0
-        for i in range(MAX_SCROLLS):
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(SCROLL_WAIT)
-
-            # Also try clicking any "load more" buttons
-            for btn_text in ["Load more", "Show more", "Next", "Load More"]:
-                try:
-                    btn = page.locator(
-                        f"button:has-text('{btn_text}'), a:has-text('{btn_text}')"
-                    ).first
-                    if btn.is_visible():
-                        btn.click()
-                        page.wait_for_timeout(PAGE_LOAD_WAIT)
-                        print(f"  [nsfwdog] Clicked '{btn_text}'")
-                except Exception:
-                    pass
-
-            # Count unique names so far
-            current = set()
-            for resp_data in captured_responses:
-                for n in extract_subreddit_names_from_firestore_json(resp_data):
-                    current.add(n.lower())
-
-            if len(current) == last_count:
-                stale += 1
-                if stale >= 5:
-                    print(f"  [nsfwdog] No new data after 5 scrolls — done.")
-                    break
-            else:
-                stale = 0
-                if i % 10 == 0:
-                    print(f"  [nsfwdog] Scroll {i+1}: {len(current)} unique names so far")
-            last_count = len(current)
-
-        # Also do a final DOM extraction as a backup
-        # Look for any reddit.com/r/ links that were rendered
-        try:
-            for link in page.locator("a[href*='reddit.com/r/']").all():
-                href = link.get_attribute("href") or ""
-                m = re.search(r"reddit\.com/r/([A-Za-z0-9_]+)", href)
-                if m:
-                    all_names.append(m.group(1))
-            if all_names:
-                print(f"  [nsfwdog] DOM fallback found {len(all_names)} names from rendered links")
-        except Exception:
-            pass
+        # Also grab from DOM as a baseline
+        dom_names = []
+        for link in page.locator("a[href*='/view/']").all():
+            href = link.get_attribute("href") or ""
+            m = re.search(r"/view/([A-Za-z0-9_]+)", href)
+            if m and m.group(1).lower() != "example":
+                dom_names.append(m.group(1))
 
         browser.close()
 
-    # Combine from API interception
-    for resp_data in captured_responses:
-        all_names.extend(extract_subreddit_names_from_firestore_json(resp_data))
+    info.names_from_first_page = dedupe(dom_names)
 
-    # Deduplicate
-    seen: set[str] = set()
-    unique = []
-    for n in all_names:
-        if n.lower() not in seen:
-            seen.add(n.lower())
-            unique.append(n)
+    if captured:
+        # Pick the response with the most names
+        best = max(captured, key=lambda x: len(x["names"]))
+        info.candidate_url = best["url"]
+        info.candidate_headers = best["headers"]
+        info.page_size = len(best["names"])
+        info.names_from_first_page = dedupe(
+            info.names_from_first_page + best["names"]
+        )
+        print(f"  [nsfwdog] Best API candidate: {info.candidate_url[:100]}")
+        print(f"  [nsfwdog] Page size detected: {info.page_size}")
+    else:
+        print("  [nsfwdog] No JSON API responses captured during sniffing.")
+        print(f"  [nsfwdog] DOM gave {len(info.names_from_first_page)} names from first page.")
 
-    print(f"  [nsfwdog] Total unique names captured: {len(unique)}")
+    return info
 
-    if not unique:
-        print("  [nsfwdog] WARNING: No subreddits captured from nsfwdog.")
-        print("  [nsfwdog] Run with --visible to watch what's happening in the browser.")
 
-    return unique
+# ---------------------------------------------------------------------------
+# nsfwdog — Phase 2: Direct API pagination with requests
+# ---------------------------------------------------------------------------
+
+def fetch_nsfwdog_via_api(info: ApiInfo, limit: int) -> list[str]:
+    """
+    Given a discovered API URL, paginate through it directly using requests.
+    Tries common pagination patterns (page=N, offset=N, cursor, after).
+    """
+    if req_lib is None:
+        print("  [nsfwdog] 'requests' not installed — cannot use direct API mode.")
+        return info.names_from_first_page
+
+    base_url = info.candidate_url
+    headers = {k: v for k, v in info.candidate_headers.items()
+               if k.lower() not in ("host", "cookie", "content-length")}
+
+    all_names = list(info.names_from_first_page)
+    page_size = max(info.page_size, 20)
+
+    print(f"  [nsfwdog] Phase 2 — direct API pagination (limit={limit}) …")
+
+    # Try page-based pagination first
+    page_num = 2  # page 1 already captured
+    consecutive_empty = 0
+
+    while len(all_names) < limit:
+        # Try different pagination params — nsfwdog may use any of these
+        tried_urls = []
+        for param in [f"page={page_num}", f"p={page_num}",
+                      f"offset={(page_num-1)*page_size}", f"skip={(page_num-1)*page_size}"]:
+            sep = "&" if "?" in base_url else "?"
+            tried_urls.append(f"{base_url}{sep}{param}")
+
+        got_names = []
+        for url in tried_urls:
+            try:
+                r = req_lib.get(url, headers=headers, timeout=NSFWDOG_API_TIMEOUT)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                names = _looks_like_subreddit_list(data)
+                if names:
+                    got_names = names
+                    break
+            except Exception:
+                continue
+
+        if not got_names:
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                print(f"  [nsfwdog] API pagination stopped at page {page_num} "
+                      f"(3 empty responses).")
+                break
+        else:
+            consecutive_empty = 0
+            new = [n for n in got_names if n.lower() not in
+                   {x.lower() for x in all_names}]
+            all_names.extend(new)
+            if page_num % 50 == 0:
+                print(f"  [nsfwdog] Page {page_num}: {len(all_names)} total so far")
+
+        page_num += 1
+        time.sleep(NSFWDOG_API_DELAY)
+
+    return dedupe(all_names)[:limit]
+
+
+# ---------------------------------------------------------------------------
+# nsfwdog — browser fallback (slower, capped)
+# ---------------------------------------------------------------------------
+
+def scrape_nsfwdog_browser_fallback(args: argparse.Namespace,
+                                     seed_names: list[str],
+                                     limit: int) -> list[str]:
+    """
+    Browser-based fallback: paginate through nsfwdog using Next buttons.
+    Slower than the API approach but works regardless of API discovery.
+    """
+    all_names = list(seed_names)
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=args.headless)
+        ctx = browser.new_context(user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ))
+        page = ctx.new_page()
+
+        page.goto("https://nsfwdog.com/browse?dir=desc", wait_until="networkidle")
+        page.wait_for_timeout(PAGE_LOAD_WAIT)
+
+        for page_num in range(2, MAX_NSFWDOG_BROWSER_PAGES + 1):
+            if len(all_names) >= limit:
+                print(f"  [nsfwdog] Reached limit of {limit}.")
+                break
+
+            nxt = page.locator("a:has-text('Next'), button:has-text('Next')").first
+            if not nxt.is_visible():
+                print("  [nsfwdog] No more pages.")
+                break
+            nxt.click()
+            page.wait_for_timeout(PAGE_LOAD_WAIT)
+
+            try:
+                page.wait_for_selector("a[href*='/view/']", timeout=8_000)
+            except Exception:
+                break
+
+            names = []
+            for link in page.locator("a[href*='/view/']").all():
+                href = link.get_attribute("href") or ""
+                m = re.search(r"/view/([A-Za-z0-9_]+)", href)
+                if m and m.group(1).lower() != "example":
+                    names.append(m.group(1))
+
+            print(f"  [nsfwdog] Browser page {page_num}: {len(names)} subreddits")
+            all_names.extend(names)
+
+        browser.close()
+
+    return dedupe(all_names)[:limit]
+
+
+# ---------------------------------------------------------------------------
+# nsfwdog orchestrator
+# ---------------------------------------------------------------------------
+
+def scrape_nsfwdog(args: argparse.Namespace) -> list[str]:
+    limit = args.nsfwdog_limit
+
+    # Phase 1: sniff
+    info = sniff_nsfwdog_api(args)
+
+    # Phase 2: use API if discovered, else browser fallback
+    if info.candidate_url:
+        all_names = fetch_nsfwdog_via_api(info, limit)
+        # If API pagination gave nothing useful, fall back
+        if len(all_names) <= len(info.names_from_first_page):
+            print("  [nsfwdog] API pagination didn't yield more results — "
+                  "switching to browser fallback.")
+            all_names = scrape_nsfwdog_browser_fallback(
+                args, info.names_from_first_page, limit
+            )
+    else:
+        print("  [nsfwdog] No API found — using browser pagination fallback.")
+        all_names = scrape_nsfwdog_browser_fallback(
+            args, info.names_from_first_page, limit
+        )
+
+    result = dedupe(all_names)[:limit]
+    print(f"  [nsfwdog] Total unique names: {len(result)}")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +495,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sort", action="store_true")
     p.add_argument("--order", choices=["daily", "weekly", "monthly", "yearly"],
                    default="daily")
-    p.add_argument("--min-subs", type=int, default=0)
+    p.add_argument("--min-subs", type=int, default=0,
+                   help="subriff min subscriber filter")
+    p.add_argument("--nsfwdog-limit", type=int, default=10_000,
+                   help="Max subreddits to pull from nsfwdog (default 10000 — "
+                        "sorted largest-first so you get the most active ones; "
+                        "set to 0 for no limit)")
     p.add_argument("--no-filter", action="store_true")
     p.add_argument("--filter-log", action="store_true")
     p.add_argument("--skip-subriff", action="store_true")
@@ -387,6 +523,9 @@ def write_output(names: list[str], path: str, sort: bool) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.nsfwdog_limit == 0:
+        args.nsfwdog_limit = 999_999  # effectively unlimited
+
     start = time.time()
     sources: list[list[str]] = []
 
@@ -397,7 +536,7 @@ def main() -> None:
         print("Skipping subriff.com")
 
     if not args.skip_nsfwdog:
-        print("\n=== Scraping nsfwdog.com (established NSFW, via API interception) ===")
+        print(f"\n=== Scraping nsfwdog.com (limit: {args.nsfwdog_limit:,}) ===")
         sources.append(scrape_nsfwdog(args))
     else:
         print("Skipping nsfwdog.com")
