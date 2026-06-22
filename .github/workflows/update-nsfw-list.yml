@@ -1,0 +1,39 @@
+name: Update NSFW Subreddit List
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # every day at 06:00 UTC — edit to taste
+  workflow_dispatch:       # lets you trigger it manually from the Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write      # needed so the job can commit back to the repo
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
+
+      - name: Run scraper
+        run: python subriff_nsfw_scraper.py --sort --order daily
+
+      - name: Commit updated list
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add NSFWsubreddits.txt
+          # Only commit if the file actually changed
+          git diff --cached --quiet || git commit -m "chore: update NSFW subreddit list [$(date -u '+%Y-%m-%d')]"
+          git push
