@@ -4,9 +4,11 @@ subriff_nsfw_scraper.py
 -----------------------
 Scrapes NSFW subreddits from two sources:
   1. subriff.com  — trending/fastest-growing NSFW communities (browser + DOM)
-  2. nsfwdog.com  — established NSFW communities via direct API calls:
-       a) api2.nsfwdog.com/v1/hierarchy/nodes/         — full indexed list (~2,300 subs)
-       b) api2.nsfwdog.com/v1/subreddits/top/          — top by subscriber count, paginated
+  2. nsfwdog.com  — 89k+ established communities via direct API
+                    api2.nsfwdog.com/v1/subreddits/top/?ordering=-subscribers
+                    Standard DRF pagination, 16 results per page.
+                    Capped at --nsfwdog-limit (default 10,000) — sorted
+                    largest-first so small/unknown subs are excluded.
 
 Merges both lists, applies a gay/trans keyword filter, and writes:
   NSFWsubreddits.txt  (one subreddit per line, no r/ prefix)
@@ -52,7 +54,7 @@ USE_TRAP_FILTER = True
 WHITELIST: set[str] = set()
 
 SUBRIFF_WAIT      = 2_500
-NSFWDOG_API_DELAY = 0.5    # slightly more polite to avoid rate limiting
+NSFWDOG_API_DELAY = 0.25
 
 NSFWDOG_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -62,9 +64,9 @@ NSFWDOG_HEADERS = {
     "Origin": "https://nsfwdog.com",
 }
 
-# Known API endpoints discovered via network sniffing
-NSFWDOG_NODES_URL = "https://api2.nsfwdog.com/v1/hierarchy/nodes/"
-NSFWDOG_TOP_URL   = "https://api2.nsfwdog.com/v1/subreddits/top/?ordering=-subscribers&page={page}"
+NSFWDOG_START_URL = (
+    "https://api2.nsfwdog.com/v1/subreddits/top/?ordering=-subscribers&page=1"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -123,61 +125,38 @@ def dedupe(names: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Extract subreddit names from a JSON response
+# Extract subreddit names from one page of results
 # ---------------------------------------------------------------------------
 
-def extract_names(data, log_structure: bool = False) -> list[str]:
+SUBREDDIT_NAME_FIELDS = (
+    "name", "subreddit_name", "subredditName",
+    "display_name", "displayName", "slug",
+)
+
+def extract_from_results(data: dict, log_fields: bool = False) -> list[str]:
     """
-    Pull subreddit names from a nsfwdog API response.
-    Logs the top-level keys on first call so we can see the structure.
+    Extract subreddit names ONLY from the 'results' array in a DRF response.
+    Each item in results is one subreddit — we grab its name field directly
+    rather than walking the whole tree.
     """
+    results = data.get("results", [])
+
+    if log_fields and results:
+        first = results[0] if isinstance(results[0], dict) else {}
+        print(f"  [nsfwdog] Result item keys: {list(first.keys())}")
+        print(f"  [nsfwdog] Sample item: { {k: str(v)[:40] for k, v in list(first.items())[:5]} }")
+
     names = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        for field in SUBREDDIT_NAME_FIELDS:
+            val = item.get(field)
+            if val and isinstance(val, str) and re.match(r'^[A-Za-z0-9_]{2,50}$', val.strip()):
+                names.append(val.strip())
+                break  # only take one name per result item
 
-    if log_structure and isinstance(data, dict):
-        print(f"  [nsfwdog] Response keys: {list(data.keys())[:10]}")
-        for k, v in list(data.items())[:3]:
-            preview = str(v)[:80]
-            print(f"  [nsfwdog]   {k}: {preview}")
-
-    def walk(obj, depth=0):
-        if depth > 8:
-            return
-        if isinstance(obj, dict):
-            for key in ("name", "subreddit", "subreddit_name", "subredditName",
-                        "display_name", "displayName", "slug"):
-                val = obj.get(key)
-                if isinstance(val, str) and re.match(r'^[A-Za-z0-9_]{2,50}$', val.strip()):
-                    names.append(val.strip())
-            for v in obj.values():
-                walk(v, depth + 1)
-        elif isinstance(obj, list):
-            for item in obj:
-                walk(item, depth + 1)
-
-    walk(data)
-
-    # Fallback patterns
-    raw = str(data)
-    for m in re.finditer(r'/view/([A-Za-z0-9_]{2,50})', raw):
-        if m.group(1).lower() != "example":
-            names.append(m.group(1))
-    for m in re.finditer(r'reddit\.com/r/([A-Za-z0-9_]{2,50})', raw):
-        names.append(m.group(1))
-
-    return dedupe(names)
-
-
-def api_get(url: str) -> dict | list | None:
-    """Make a single GET request to the nsfwdog API."""
-    try:
-        r = req_lib.get(url, headers=NSFWDOG_HEADERS, timeout=15)
-        if r.status_code in (400, 404):
-            return None
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"  [nsfwdog] Request error for {url}: {e}")
-        return None
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -237,54 +216,57 @@ def scrape_subriff(args: argparse.Namespace) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# nsfwdog (direct API)
+# nsfwdog (direct API, targeted extraction)
 # ---------------------------------------------------------------------------
 
 def scrape_nsfwdog(args: argparse.Namespace) -> list[str]:
     limit = args.nsfwdog_limit
     all_names: list[str] = []
-
-    # --- Source A: hierarchy/nodes (full list in one call) ---
-    print(f"  [nsfwdog] Fetching hierarchy/nodes …")
-    data = api_get(NSFWDOG_NODES_URL)
-    if data:
-        names = extract_names(data, log_structure=True)
-        all_names.extend(names)
-        print(f"  [nsfwdog] hierarchy/nodes: {len(names)} names")
-    else:
-        print("  [nsfwdog] hierarchy/nodes returned nothing.")
-
-    # --- Source B: subreddits/top (paginated, sorted by subscriber count) ---
-    print(f"  [nsfwdog] Fetching subreddits/top (paginated) …")
-    page_num = 1
+    next_url: str | None = NSFWDOG_START_URL
+    page_num = 0
     consecutive_empty = 0
 
-    while len(all_names) < limit:
-        url = NSFWDOG_TOP_URL.format(page=page_num)
-        data = api_get(url)
+    print(f"  [nsfwdog] Fetching top {limit:,} subreddits via API …")
 
-        if data is None:
-            print(f"  [nsfwdog] subreddits/top stopped at page {page_num}.")
-            break
+    while next_url and len(all_names) < limit:
+        page_num += 1
 
-        names = extract_names(data, log_structure=(page_num == 1))
-        new = [n for n in names if n.lower() not in {x.lower() for x in all_names}]
-
-        if not new:
+        try:
+            r = req_lib.get(next_url, headers=NSFWDOG_HEADERS, timeout=15)
+            if r.status_code in (400, 404):
+                print(f"  [nsfwdog] API returned {r.status_code} — stopping.")
+                break
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"  [nsfwdog] Error on page {page_num}: {e}")
             consecutive_empty += 1
-            if page_num <= 10 or page_num % 20 == 0:
-                print(f"  [nsfwdog] Page {page_num}: 0 new (streak: {consecutive_empty})")
+            if consecutive_empty >= 3:
+                break
+            time.sleep(2)
+            continue
+
+        # Log the structure of page 1 and the item fields
+        log_fields = (page_num == 1)
+        if page_num == 1:
+            print(f"  [nsfwdog] Total indexed: {data.get('count', '?'):,}")
+
+        names = extract_from_results(data, log_fields=log_fields)
+        next_url = data.get("next")  # follow DRF's own next URL
+
+        if not names:
+            consecutive_empty += 1
             if consecutive_empty >= 5:
                 print(f"  [nsfwdog] 5 consecutive empty pages — stopping.")
                 break
         else:
             consecutive_empty = 0
-            all_names.extend(new)
-            if page_num <= 5 or page_num % 50 == 0:
-                print(f"  [nsfwdog] Page {page_num}: {len(new)} new "
-                      f"(total: {len(all_names):,} / {limit:,})")
+            all_names.extend(names)
 
-        page_num += 1
+        if page_num <= 3 or page_num % 100 == 0:
+            print(f"  [nsfwdog] Page {page_num}: {len(names)} names  "
+                  f"(total: {len(all_names):,} / {limit:,})")
+
         time.sleep(NSFWDOG_API_DELAY)
 
     result = dedupe(all_names)[:limit]
@@ -335,7 +317,7 @@ def main() -> None:
         sources.append(scrape_subriff(args))
 
     if not args.skip_nsfwdog:
-        print(f"\n=== nsfwdog.com (limit: {args.nsfwdog_limit:,}) ===")
+        print(f"\n=== nsfwdog.com (top {args.nsfwdog_limit:,} by size) ===")
         sources.append(scrape_nsfwdog(args))
 
     combined = merge(*sources)
